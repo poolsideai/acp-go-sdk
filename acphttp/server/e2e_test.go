@@ -102,6 +102,10 @@ func (a *endToEndAgent) CloseSession(ctx context.Context, params acp.CloseSessio
 	return acp.CloseSessionResponse{}, nil
 }
 
+func (a *endToEndAgent) DeleteSession(ctx context.Context, params acp.DeleteSessionRequest) (acp.DeleteSessionResponse, error) {
+	return acp.DeleteSessionResponse{}, nil
+}
+
 func (a *endToEndAgent) ListSessions(ctx context.Context, params acp.ListSessionsRequest) (acp.ListSessionsResponse, error) {
 	return acp.ListSessionsResponse{}, nil
 }
