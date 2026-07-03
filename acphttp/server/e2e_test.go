@@ -23,6 +23,9 @@ import (
 type endToEndAgent struct {
 	conn           *acp.AgentSideConnection
 	sessionCounter atomic.Uint64
+	// requestPermission makes Prompt round-trip a session/request_permission
+	// call through the client before responding.
+	requestPermission bool
 }
 
 func (a *endToEndAgent) Initialize(ctx context.Context, req acp.InitializeRequest) (acp.InitializeResponse, error) {
@@ -66,6 +69,17 @@ func (a *endToEndAgent) SetSessionConfigOption(ctx context.Context, req acp.SetS
 }
 
 func (a *endToEndAgent) Prompt(ctx context.Context, req acp.PromptRequest) (acp.PromptResponse, error) {
+	if a.requestPermission && a.conn != nil {
+		if _, err := a.conn.RequestPermission(ctx, acp.RequestPermissionRequest{
+			SessionId: req.SessionId,
+			ToolCall:  acp.ToolCallUpdate{ToolCallId: acp.ToolCallId("call-1")},
+			Options: []acp.PermissionOption{
+				{OptionId: "allow", Name: "Allow", Kind: acp.PermissionOptionKindAllowOnce},
+			},
+		}); err != nil {
+			return acp.PromptResponse{}, err
+		}
+	}
 	// One streamed update + one final response.
 	if a.conn != nil {
 		_ = a.conn.SessionUpdate(ctx, acp.SessionNotification{
@@ -99,11 +113,17 @@ func (a *endToEndAgent) SetSessionMode(ctx context.Context, params acp.SetSessio
 // endToEndClient satisfies the minimal acp.Client surface needed for
 // the client-side SDK connection: we don't care about fs callbacks here.
 type endToEndClient struct {
-	updates atomic.Int64
+	updates     atomic.Int64
+	permissions atomic.Int64
 }
 
 func (c *endToEndClient) RequestPermission(ctx context.Context, req acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
-	return acp.RequestPermissionResponse{}, nil
+	c.permissions.Add(1)
+	return acp.RequestPermissionResponse{
+		Outcome: acp.RequestPermissionOutcome{
+			Selected: &acp.RequestPermissionOutcomeSelected{OptionId: "allow", Outcome: "selected"},
+		},
+	}, nil
 }
 
 func (c *endToEndClient) SessionUpdate(ctx context.Context, params acp.SessionNotification) error {
@@ -122,15 +142,19 @@ func (c *endToEndClient) WriteTextFile(ctx context.Context, req acp.WriteTextFil
 func (c *endToEndClient) CreateTerminal(ctx context.Context, req acp.CreateTerminalRequest) (acp.CreateTerminalResponse, error) {
 	return acp.CreateTerminalResponse{}, nil
 }
+
 func (c *endToEndClient) TerminalOutput(ctx context.Context, req acp.TerminalOutputRequest) (acp.TerminalOutputResponse, error) {
 	return acp.TerminalOutputResponse{}, nil
 }
+
 func (c *endToEndClient) ReleaseTerminal(ctx context.Context, req acp.ReleaseTerminalRequest) (acp.ReleaseTerminalResponse, error) {
 	return acp.ReleaseTerminalResponse{}, nil
 }
+
 func (c *endToEndClient) WaitForTerminalExit(ctx context.Context, req acp.WaitForTerminalExitRequest) (acp.WaitForTerminalExitResponse, error) {
 	return acp.WaitForTerminalExitResponse{}, nil
 }
+
 func (c *endToEndClient) KillTerminal(ctx context.Context, req acp.KillTerminalRequest) (acp.KillTerminalResponse, error) {
 	return acp.KillTerminalResponse{}, nil
 }
@@ -193,4 +217,54 @@ func TestEndToEnd_ClientTalksToServer(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return clientImpl.updates.Load() >= 1
 	}, 2*time.Second, 10*time.Millisecond, "expected session/update to reach the client")
+}
+
+// TestEndToEnd_PermissionRoundTrip drives the full server → client →
+// server request/response cycle over HTTP: the agent issues
+// session/request_permission on the session-scoped stream mid-prompt, the
+// client SDK answers, and the transport must echo Acp-Session-Id on the
+// response POST (per the RFD; the TypeScript reference server rejects the
+// response otherwise) so the prompt turn completes.
+func TestEndToEnd_PermissionRoundTrip(t *testing.T) {
+	var agent *endToEndAgent
+	srv, err := httpserver.New(httpserver.Config{
+		Factory: func(ctx context.Context) (acp.Agent, func(*acp.AgentSideConnection), func(), error) {
+			agent = &endToEndAgent{requestPermission: true}
+			return agent, func(c *acp.AgentSideConnection) { agent.conn = c }, nil, nil
+		},
+	})
+	require.NoError(t, err)
+	defer srv.Close()
+
+	httpSrv := httptest.NewServer(srv.Handler())
+	defer httpSrv.Close()
+
+	tr, err := httpclient.Dial(context.Background(), httpclient.Config{BaseURL: httpSrv.URL + "/acp"})
+	require.NoError(t, err)
+	defer tr.Close()
+
+	clientImpl := &endToEndClient{}
+	conn := acp.NewClientSideConnection(clientImpl, tr, tr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	_, err = conn.Initialize(ctx, acp.InitializeRequest{
+		ProtocolVersion: acp.ProtocolVersionNumber,
+		ClientInfo:      &acp.Implementation{Name: "e2e", Version: "0"},
+	})
+	require.NoError(t, err)
+
+	newResp, err := conn.NewSession(ctx, acp.NewSessionRequest{Cwd: "/tmp", McpServers: []acp.McpServer{}})
+	require.NoError(t, err)
+
+	promptResp, err := conn.Prompt(ctx, acp.PromptRequest{
+		SessionId: newResp.SessionId,
+		Prompt: []acp.ContentBlock{
+			{Text: &acp.ContentBlockText{Text: "do something that needs permission"}},
+		},
+	})
+	require.NoError(t, err, "prompt must complete: the permission response POST must be accepted")
+	assert.Equal(t, acp.StopReasonEndTurn, promptResp.StopReason)
+	assert.Equal(t, int64(1), clientImpl.permissions.Load(), "client should have been asked for permission exactly once")
 }

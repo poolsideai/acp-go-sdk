@@ -32,6 +32,27 @@ func TestHasMethod(t *testing.T) {
 	assert.False(t, HasMethod([]byte(`bad`)))
 }
 
+func TestIsErrorResponse(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{"error response", `{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"boom"}}`, true},
+		{"result response", `{"jsonrpc":"2.0","id":1,"result":{}}`, false},
+		{"null error", `{"jsonrpc":"2.0","id":1,"error":null}`, false},
+		{"request", `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`, false},
+		{"request with error-shaped params", `{"jsonrpc":"2.0","id":1,"method":"x","error":{"code":1}}`, false},
+		{"malformed", `{not json}`, false},
+		{"empty", ``, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, IsErrorResponse([]byte(tc.raw)))
+		})
+	}
+}
+
 func TestPeekParamsSessionID(t *testing.T) {
 	cases := []struct {
 		name string

@@ -132,6 +132,15 @@ func (t *Transport) dispatch(msg []byte) error {
 
 	sessionID := acphttp.PeekParamsSessionID(msg)
 
+	// Responses carry no params.sessionId; for a response to a server →
+	// client request that arrived on a session-scoped stream, the RFD
+	// requires the POST to echo that stream's Acp-Session-Id (the
+	// TypeScript reference server rejects it with 400 otherwise). Look up
+	// the session recorded when the request was received.
+	if method == "" && sessionID == "" {
+		sessionID = t.takeServerRequestSession(acphttp.CanonicalID(msg))
+	}
+
 	// Eagerly open the session-scoped GET stream before sending any
 	// session-scoped POST. This prevents a race where a fast server emits
 	// session/update notifications before we've opened the stream. The
@@ -200,12 +209,6 @@ func (t *Transport) doInitialize(msg []byte) error {
 		return fmt.Errorf("httpclient: initialize returned %d: %s", resp.StatusCode, bytes.TrimSpace(body))
 	}
 
-	connID := resp.Header.Get(headerConnectionID)
-	if connID == "" {
-		return fmt.Errorf("httpclient: initialize response missing %s header", headerConnectionID)
-	}
-	t.setConnID(connID)
-
 	// Read the JSON body (should be a complete JSON-RPC response object).
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
 	if err != nil {
@@ -216,6 +219,24 @@ func (t *Transport) doInitialize(msg []byte) error {
 	if !json.Valid(trimmed) {
 		return fmt.Errorf("httpclient: initialize body is not valid JSON: %s", trimmed)
 	}
+
+	connID := resp.Header.Get(headerConnectionID)
+	if connID == "" {
+		// A server that rejects initialize (the agent answered with a
+		// JSON-RPC error) tears the connection down and omits the
+		// Acp-Connection-Id header — the Rust reference server does
+		// exactly this. Deliver the error response to the SDK so the
+		// initialize call fails with the agent's error instead of an
+		// opaque transport error. No streams are opened; there is no
+		// connection to stream from.
+		if acphttp.IsErrorResponse(trimmed) {
+			t.logger.Info("initialize rejected by agent")
+			t.pushInbound(trimmed)
+			return nil
+		}
+		return fmt.Errorf("httpclient: initialize response missing %s header", headerConnectionID)
+	}
+	t.setConnID(connID)
 
 	t.logger.Info("initialize OK", "connection_id", connID)
 

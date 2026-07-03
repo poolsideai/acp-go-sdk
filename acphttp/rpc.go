@@ -117,6 +117,25 @@ func IsInitialize(raw []byte) bool {
 	return CanonicalID(raw) != ""
 }
 
+// IsErrorResponse reports whether raw is a JSON-RPC error response: a
+// message with no "method" field and a non-null "error" field. Used to
+// detect a rejected initialize, which both sides special-case: the server
+// tears the connection down and omits Acp-Connection-Id (matching the Rust
+// reference server), and the client delivers the error to the SDK instead
+// of insisting on the missing header.
+func IsErrorResponse(raw []byte) bool {
+	var probe struct {
+		Method string          `json:"method"`
+		Error  json.RawMessage `json:"error"`
+	}
+	_ = json.Unmarshal(raw, &probe)
+	if probe.Method != "" {
+		return false
+	}
+	e := bytes.TrimSpace(probe.Error)
+	return len(e) > 0 && !bytes.Equal(e, []byte("null"))
+}
+
 // IsSessionScoped reports whether the JSON-RPC method must carry an
 // Acp-Session-Id header on a POST and is logically associated with a
 // single session. Derived from the ACP schema by listing every

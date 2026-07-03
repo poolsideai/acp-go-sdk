@@ -191,6 +191,15 @@ type connection struct {
 	pendingMu sync.Mutex
 	pending   map[string]pendingResponse
 
+	// clientResponses records, for each server → client request routed to a
+	// session-scoped stream, which session the client's response POST is
+	// expected to reference (keyed by the canonical JSON-RPC id). Per the
+	// RFD, responses to session-scoped server requests (request_permission,
+	// fs/read, ...) are themselves session-scoped POSTs; the TypeScript
+	// reference server validates their Acp-Session-Id against this table.
+	clientResponsesMu sync.Mutex
+	clientResponses   map[string]string
+
 	ctx    context.Context
 	cancel context.CancelFunc
 
@@ -235,17 +244,18 @@ func (s *Server) createConnection() (*connection, error) {
 
 	id := uuid.NewString()
 	c := &connection{
-		id:             id,
-		logger:         s.logger.With("conn", id),
-		toAgentR:       toAgentR,
-		toAgentW:       toAgentW,
-		fromAgentR:     fromAgentR,
-		fromAgentW:     fromAgentW,
-		agentCleanup:   cleanup,
-		pending:        make(map[string]pendingResponse),
-		ctx:            ctx,
-		cancel:         cancel,
-		initResponseCh: make(chan string, 1),
+		id:              id,
+		logger:          s.logger.With("conn", id),
+		toAgentR:        toAgentR,
+		toAgentW:        toAgentW,
+		fromAgentR:      fromAgentR,
+		fromAgentW:      fromAgentW,
+		agentCleanup:    cleanup,
+		pending:         make(map[string]pendingResponse),
+		clientResponses: make(map[string]string),
+		ctx:             ctx,
+		cancel:          cancel,
+		initResponseCh:  make(chan string, 1),
 	}
 	c.connStream = newOutboundStream(c.logger.With("stream", "connection"))
 
@@ -329,6 +339,36 @@ func (c *connection) takePendingRoute(idKey string) (pendingResponse, bool) {
 	return r, ok
 }
 
+// recordClientResponseSession remembers that the server request identified
+// by idKey went out on the session-scoped stream for sessionID, so the
+// client's response POST can be validated against it.
+func (c *connection) recordClientResponseSession(idKey, sessionID string) {
+	if idKey == "" {
+		return
+	}
+	c.clientResponsesMu.Lock()
+	c.clientResponses[idKey] = sessionID
+	c.clientResponsesMu.Unlock()
+}
+
+// peekClientResponseSession returns the session recorded for idKey without
+// removing it; dropClientResponseSession removes it once the response has
+// been forwarded. Lookup and removal are split so a rejected POST (e.g. a
+// mismatched Acp-Session-Id) does not consume the entry — the client can
+// retry with the correct header.
+func (c *connection) peekClientResponseSession(idKey string) (string, bool) {
+	c.clientResponsesMu.Lock()
+	defer c.clientResponsesMu.Unlock()
+	sid, ok := c.clientResponses[idKey]
+	return sid, ok
+}
+
+func (c *connection) dropClientResponseSession(idKey string) {
+	c.clientResponsesMu.Lock()
+	delete(c.clientResponses, idKey)
+	c.clientResponsesMu.Unlock()
+}
+
 // startRouter launches the goroutine that reads outbound agent messages
 // line-by-line and fans them out. It is safe to call once per connection.
 // The first JSON-RPC message (the initialize response) is intercepted and
@@ -390,6 +430,12 @@ func (c *connection) route(msg string) {
 		return acphttp.SessionTarget(r.sessionID), true
 	})
 	if target.IsSession() {
+		// A server → client *request* on a session stream obliges the
+		// client to echo Acp-Session-Id on its response POST; remember
+		// the session so handlePost can validate it.
+		if acphttp.HasMethod(raw) {
+			c.recordClientResponseSession(acphttp.CanonicalID(raw), target.SessionID)
+		}
 		c.getOrCreateSessionStream(target.SessionID).push(msg)
 		return
 	}

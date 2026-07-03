@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -25,9 +26,18 @@ type stubAgent struct {
 	sessionCounter atomic.Uint64
 	conn           *acp.AgentSideConnection
 	promptCalls    atomic.Uint64
+	// initErr, when non-nil, makes Initialize fail so tests can exercise
+	// the rejected-initialize path.
+	initErr error
+	// permissionOnPrompt makes Prompt issue a session/request_permission
+	// call back to the client and block until the response arrives.
+	permissionOnPrompt bool
 }
 
 func (a *stubAgent) Initialize(ctx context.Context, req acp.InitializeRequest) (acp.InitializeResponse, error) {
+	if a.initErr != nil {
+		return acp.InitializeResponse{}, a.initErr
+	}
 	return acp.InitializeResponse{
 		ProtocolVersion: acp.ProtocolVersionNumber,
 		AgentInfo:       &acp.Implementation{Name: "stub-agent", Version: "0.0.1"},
@@ -69,6 +79,17 @@ func (a *stubAgent) Logout(ctx context.Context, req acp.LogoutRequest) (acp.Logo
 
 func (a *stubAgent) Prompt(ctx context.Context, req acp.PromptRequest) (acp.PromptResponse, error) {
 	a.promptCalls.Add(1)
+	if a.permissionOnPrompt && a.conn != nil {
+		if _, err := a.conn.RequestPermission(ctx, acp.RequestPermissionRequest{
+			SessionId: req.SessionId,
+			ToolCall:  acp.ToolCallUpdate{ToolCallId: acp.ToolCallId("call-1")},
+			Options: []acp.PermissionOption{
+				{OptionId: "allow", Name: "Allow", Kind: acp.PermissionOptionKindAllowOnce},
+			},
+		}); err != nil {
+			return acp.PromptResponse{}, err
+		}
+	}
 	// Emit one session update notification so session-scoped streaming
 	// has something to exercise.
 	if a.conn != nil {
@@ -281,7 +302,8 @@ func TestSessionStreamReplaysPreSubscribeBuffer(t *testing.T) {
 
 	// initialize
 	req, _ := http.NewRequest(http.MethodPost, base, strings.NewReader(
-		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2}}`))
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2}}`,
+	))
 	req.Header.Set("Content-Type", mimeJSON)
 	resp, err := client.Do(req)
 	require.NoError(t, err)
@@ -295,7 +317,8 @@ func TestSessionStreamReplaysPreSubscribeBuffer(t *testing.T) {
 
 	// session/new
 	req, _ = http.NewRequest(http.MethodPost, base, strings.NewReader(
-		`{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[]}}`))
+		`{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[]}}`,
+	))
 	req.Header.Set("Content-Type", mimeJSON)
 	req.Header.Set(HeaderConnectionID, connID)
 	resp, err = client.Do(req)
@@ -306,7 +329,8 @@ func TestSessionStreamReplaysPreSubscribeBuffer(t *testing.T) {
 
 	// session/prompt WITHOUT opening the session-scoped GET first.
 	req, _ = http.NewRequest(http.MethodPost, base, strings.NewReader(
-		`{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"sess-1","prompt":[]}}`))
+		`{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"sess-1","prompt":[]}}`,
+	))
 	req.Header.Set("Content-Type", mimeJSON)
 	req.Header.Set(HeaderConnectionID, connID)
 	req.Header.Set(HeaderSessionID, "sess-1")
@@ -377,7 +401,8 @@ func TestMaxConnectionsRejectsWith503(t *testing.T) {
 
 	initialize := func() *http.Response {
 		req, _ := http.NewRequest(http.MethodPost, base, strings.NewReader(
-			`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2}}`))
+			`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2}}`,
+		))
 		req.Header.Set("Content-Type", mimeJSON)
 		resp, err := client.Do(req)
 		require.NoError(t, err)
@@ -429,7 +454,8 @@ func TestSessionLoadResponseGoesToConnectionStream(t *testing.T) {
 
 	// initialize
 	req, _ := http.NewRequest(http.MethodPost, base, strings.NewReader(
-		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2}}`))
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2}}`,
+	))
 	req.Header.Set("Content-Type", mimeJSON)
 	resp, err := client.Do(req)
 	require.NoError(t, err)
@@ -445,7 +471,8 @@ func TestSessionLoadResponseGoesToConnectionStream(t *testing.T) {
 	// POST session/load with both headers; the spec considers session/load
 	// session-scoped, but its response must land on the connection stream.
 	req, _ = http.NewRequest(http.MethodPost, base, strings.NewReader(
-		`{"jsonrpc":"2.0","id":7,"method":"session/load","params":{"sessionId":"sess-loaded","cwd":"/tmp","mcpServers":[]}}`))
+		`{"jsonrpc":"2.0","id":7,"method":"session/load","params":{"sessionId":"sess-loaded","cwd":"/tmp","mcpServers":[]}}`,
+	))
 	req.Header.Set("Content-Type", mimeJSON)
 	req.Header.Set(HeaderConnectionID, connID)
 	req.Header.Set(HeaderSessionID, "sess-loaded")
@@ -483,7 +510,8 @@ func TestSpuriousSessionHeaderDoesNotDivertConnectionResponse(t *testing.T) {
 	client := &http.Client{Timeout: 10 * time.Second}
 
 	req, _ := http.NewRequest(http.MethodPost, base, strings.NewReader(
-		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2}}`))
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2}}`,
+	))
 	req.Header.Set("Content-Type", mimeJSON)
 	resp, err := client.Do(req)
 	require.NoError(t, err)
@@ -499,7 +527,8 @@ func TestSpuriousSessionHeaderDoesNotDivertConnectionResponse(t *testing.T) {
 	// session/new is NOT session-scoped, but we attach a spurious
 	// Acp-Session-Id header anyway.
 	req, _ = http.NewRequest(http.MethodPost, base, strings.NewReader(
-		`{"jsonrpc":"2.0","id":9,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[]}}`))
+		`{"jsonrpc":"2.0","id":9,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[]}}`,
+	))
 	req.Header.Set("Content-Type", mimeJSON)
 	req.Header.Set(HeaderConnectionID, connID)
 	req.Header.Set(HeaderSessionID, "bogus-sess")
@@ -550,6 +579,259 @@ func TestGetWithoutAcceptIs406(t *testing.T) {
 	require.NoError(t, err)
 	resp.Body.Close()
 	assert.Equal(t, http.StatusNotAcceptable, resp.StatusCode)
+}
+
+// initializeConn is a helper: POST initialize and return the connection id.
+func initializeConn(t *testing.T, client *http.Client, base string) string {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodPost, base, strings.NewReader(
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2}}`,
+	))
+	req.Header.Set("Content-Type", mimeJSON)
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	connID := resp.Header.Get(HeaderConnectionID)
+	require.NotEmpty(t, connID)
+	return connID
+}
+
+// postJSON is a helper: POST a raw JSON-RPC message with the given headers
+// and return the status code.
+func postJSON(t *testing.T, client *http.Client, base, body, connID, sessionID string) int {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodPost, base, strings.NewReader(body))
+	req.Header.Set("Content-Type", mimeJSON)
+	if connID != "" {
+		req.Header.Set(HeaderConnectionID, connID)
+	}
+	if sessionID != "" {
+		req.Header.Set(HeaderSessionID, sessionID)
+	}
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode
+}
+
+// TestSessionHeaderParamsMismatchIs400 verifies that an Acp-Session-Id
+// header contradicting params.sessionId is rejected, matching both
+// reference servers.
+func TestSessionHeaderParamsMismatchIs400(t *testing.T) {
+	base, stop := startServer(t, func(ctx context.Context) (acp.Agent, func(*acp.AgentSideConnection), func(), error) {
+		a := &stubAgent{}
+		return a, func(c *acp.AgentSideConnection) { a.conn = c }, nil, nil
+	})
+	defer stop()
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	connID := initializeConn(t, client, base)
+
+	status := postJSON(t, client,
+		base, `{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"sess-a","prompt":[]}}`,
+		connID, "sess-b")
+	assert.Equal(t, http.StatusBadRequest, status)
+}
+
+// TestClientResponseSessionValidation drives a full permission round trip
+// and checks the response-POST validation rules: a response whose
+// Acp-Session-Id contradicts the session the server request went out on is
+// rejected with 400; a matching header and a missing header (tolerated for
+// compatibility with clients that do not send one on responses, e.g. the
+// Rust reference client) are both accepted.
+func TestClientResponseSessionValidation(t *testing.T) {
+	var agent *stubAgent
+	base, stop := startServer(t, func(ctx context.Context) (acp.Agent, func(*acp.AgentSideConnection), func(), error) {
+		agent = &stubAgent{permissionOnPrompt: true}
+		return agent, func(c *acp.AgentSideConnection) { agent.conn = c }, nil, nil
+	})
+	defer stop()
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	connID := initializeConn(t, client, base)
+
+	connStream := openStream(t, base, connID, "")
+	defer connStream.close()
+
+	status := postJSON(t, client,
+		base, `{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[]}}`,
+		connID, "")
+	require.Equal(t, http.StatusAccepted, status)
+	require.Contains(t, connStream.waitFor(t, 2*time.Second), `"sessionId":"sess-1"`)
+
+	sessionStream := openStream(t, base, connID, "sess-1")
+	defer sessionStream.close()
+
+	// waitForPermissionRequest reads session-stream events until the
+	// request_permission request appears, returning its JSON-RPC id.
+	waitForPermissionRequest := func() string {
+		t.Helper()
+		for {
+			ev := sessionStream.waitFor(t, 2*time.Second)
+			var msg struct {
+				ID     json.RawMessage `json:"id"`
+				Method string          `json:"method"`
+			}
+			require.NoError(t, json.Unmarshal([]byte(ev), &msg))
+			if msg.Method == "session/request_permission" {
+				return string(msg.ID)
+			}
+		}
+	}
+	permissionResponse := func(id string) string {
+		return `{"jsonrpc":"2.0","id":` + id + `,"result":{"outcome":{"outcome":"selected","optionId":"allow"}}}`
+	}
+	waitForPromptResponse := func(promptID string) {
+		t.Helper()
+		for {
+			ev := sessionStream.waitFor(t, 2*time.Second)
+			if strings.Contains(ev, `"id":`+promptID) && !strings.Contains(ev, `"method"`) {
+				return
+			}
+		}
+	}
+
+	// --- Turn 1: mismatched header is rejected, matching header accepted ---
+	status = postJSON(t, client,
+		base, `{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"sess-1","prompt":[]}}`,
+		connID, "sess-1")
+	require.Equal(t, http.StatusAccepted, status)
+	permID := waitForPermissionRequest()
+
+	status = postJSON(t, client, base, permissionResponse(permID), connID, "some-other-session")
+	assert.Equal(t, http.StatusBadRequest, status, "mismatched Acp-Session-Id on a response must be rejected")
+
+	status = postJSON(t, client, base, permissionResponse(permID), connID, "sess-1")
+	require.Equal(t, http.StatusAccepted, status, "matching Acp-Session-Id must be accepted")
+	waitForPromptResponse("3")
+
+	// --- Turn 2: a response without any Acp-Session-Id is tolerated ---
+	status = postJSON(t, client,
+		base, `{"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":"sess-1","prompt":[]}}`,
+		connID, "sess-1")
+	require.Equal(t, http.StatusAccepted, status)
+	permID = waitForPermissionRequest()
+
+	status = postJSON(t, client, base, permissionResponse(permID), connID, "")
+	require.Equal(t, http.StatusAccepted, status, "missing Acp-Session-Id on a response is tolerated")
+	waitForPromptResponse("4")
+}
+
+// TestInitializeRejectedTearsDownConnection verifies the rejected-initialize
+// contract shared with the Rust reference server: the agent's JSON-RPC error
+// is returned as the 200 body, no Acp-Connection-Id header is set, and the
+// connection is torn down rather than left for the client to DELETE.
+func TestInitializeRejectedTearsDownConnection(t *testing.T) {
+	srv, err := New(Config{Factory: func(ctx context.Context) (acp.Agent, func(*acp.AgentSideConnection), func(), error) {
+		a := &stubAgent{initErr: fmt.Errorf("agent says no")}
+		return a, func(c *acp.AgentSideConnection) { a.conn = c }, nil, nil
+	}})
+	require.NoError(t, err)
+	httpSrv := httptest.NewServer(srv.Handler())
+	defer func() {
+		_ = srv.Close()
+		httpSrv.Close()
+	}()
+	base := httpSrv.URL + "/acp"
+
+	req, _ := http.NewRequest(http.MethodPost, base, strings.NewReader(
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2}}`,
+	))
+	req.Header.Set("Content-Type", mimeJSON)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Empty(t, resp.Header.Get(HeaderConnectionID), "rejected initialize must not hand out a connection id")
+	body, _ := io.ReadAll(resp.Body)
+	assert.Contains(t, string(body), `"error"`)
+
+	srv.mu.RLock()
+	remaining := len(srv.connections)
+	srv.mu.RUnlock()
+	assert.Zero(t, remaining, "rejected initialize must not leave a connection behind")
+}
+
+// TestInitializeOnExistingConnectionIs400 verifies that initialize carrying
+// an Acp-Connection-Id header is rejected (matching the TypeScript
+// reference server) instead of silently creating a second connection.
+func TestInitializeOnExistingConnectionIs400(t *testing.T) {
+	base, stop := startServer(t, func(ctx context.Context) (acp.Agent, func(*acp.AgentSideConnection), func(), error) {
+		a := &stubAgent{}
+		return a, func(c *acp.AgentSideConnection) { a.conn = c }, nil, nil
+	})
+	defer stop()
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	connID := initializeConn(t, client, base)
+
+	status := postJSON(t, client,
+		base, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2}}`,
+		connID, "")
+	assert.Equal(t, http.StatusBadRequest, status)
+}
+
+// TestOversizedPostIs413 verifies bodies beyond maxPostBodyBytes are
+// rejected with 413 rather than truncated into a 400 "invalid JSON".
+func TestOversizedPostIs413(t *testing.T) {
+	base, stop := startServer(t, func(ctx context.Context) (acp.Agent, func(*acp.AgentSideConnection), func(), error) {
+		return &stubAgent{}, nil, nil, nil
+	})
+	defer stop()
+
+	req, _ := http.NewRequest(http.MethodPost, base, strings.NewReader(strings.Repeat("a", maxPostBodyBytes+1)))
+	req.Header.Set("Content-Type", mimeJSON)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	assert.Equal(t, http.StatusRequestEntityTooLarge, resp.StatusCode)
+}
+
+// TestSSEKeepAliveCommentsAreSent verifies idle GET streams carry periodic
+// SSE comments so proxies do not reap them, matching the 15s keep-alives of
+// the Rust and TypeScript reference servers (shortened here for the test).
+func TestSSEKeepAliveCommentsAreSent(t *testing.T) {
+	old := sseKeepAliveInterval
+	sseKeepAliveInterval = 25 * time.Millisecond
+	defer func() { sseKeepAliveInterval = old }()
+
+	base, stop := startServer(t, func(ctx context.Context) (acp.Agent, func(*acp.AgentSideConnection), func(), error) {
+		a := &stubAgent{}
+		return a, func(c *acp.AgentSideConnection) { a.conn = c }, nil, nil
+	})
+	defer stop()
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	connID := initializeConn(t, client, base)
+
+	req, _ := http.NewRequest(http.MethodGet, base, nil)
+	req.Header.Set("Accept", mimeSSE)
+	req.Header.Set(HeaderConnectionID, connID)
+	streamClient := &http.Client{} // no timeout: SSE
+	resp, err := streamClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	// Read raw lines off the idle stream; a comment line must arrive.
+	found := make(chan struct{})
+	go func() {
+		scanner := bufio.NewScanner(resp.Body)
+		for scanner.Scan() {
+			if strings.HasPrefix(scanner.Text(), ":") {
+				close(found)
+				return
+			}
+		}
+	}()
+	select {
+	case <-found:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no SSE keep-alive comment arrived on an idle stream")
+	}
 }
 
 // ---- SSE helpers ----

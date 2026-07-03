@@ -6,11 +6,22 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/coder/acp-go-sdk/acphttp"
 )
+
+// maxPostBodyBytes caps a single POST /acp body. Oversized bodies are
+// rejected with 413 (the Rust reference server does the same at 16 MiB).
+const maxPostBodyBytes = 32 * 1024 * 1024
+
+// sseKeepAliveInterval is how often an SSE comment is written to otherwise
+// idle GET streams. 15s matches both the Rust and TypeScript reference
+// servers. A variable so tests can shorten it.
+var sseKeepAliveInterval = 15 * time.Second
 
 // handlePost handles POST /acp.
 //
@@ -24,15 +35,28 @@ import (
 //     session-scoped), forwards the message to the agent, returns 202
 //     Accepted.
 func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
-	if !strings.Contains(r.Header.Get("Content-Type"), mimeJSON) {
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != mimeJSON {
 		http.Error(w, "unsupported media type: expected application/json", http.StatusUnsupportedMediaType)
 		return
 	}
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, 32*1024*1024))
+	// Bound the request body. A declared Content-Length over the limit is
+	// rejected up front; otherwise read one byte past the limit so an
+	// oversized chunked body is detected as such (413) rather than being
+	// truncated into invalid JSON (400).
+	if r.ContentLength > maxPostBodyBytes {
+		http.Error(w, "POST body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxPostBodyBytes+1))
 	discardBody(r.Body)
 	if err != nil {
 		http.Error(w, "failed to read request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(body) > maxPostBodyBytes {
+		http.Error(w, "POST body too large", http.StatusRequestEntityTooLarge)
 		return
 	}
 	body = bytes.TrimSpace(body)
@@ -61,6 +85,13 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 	// the already-parsed envelope rather than re-unmarshalling via
 	// acphttp.IsInitialize.
 	if envelope.Method == "initialize" && acphttp.CanonicalIDFromRaw(envelope.ID) != "" {
+		// initialize always creates a fresh connection; carrying an
+		// Acp-Connection-Id here means the client is confused about its
+		// own state (matching the TypeScript reference server's check).
+		if r.Header.Get(HeaderConnectionID) != "" {
+			http.Error(w, "initialize not allowed on existing connection", http.StatusBadRequest)
+			return
+		}
 		s.handleInitialize(w, r, body)
 		return
 	}
@@ -80,6 +111,34 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 	if acphttp.IsSessionScoped(envelope.Method) && sessionHeader == "" {
 		http.Error(w, "missing "+HeaderSessionID+" for session-scoped method", http.StatusBadRequest)
 		return
+	}
+	// An Acp-Session-Id header that contradicts params.sessionId is a
+	// client bug; both reference servers reject it (the Rust server when
+	// reconciling the header into params, the TypeScript server explicitly).
+	if envelope.Method != "" && sessionHeader != "" &&
+		envelope.Params.SessionID != "" && envelope.Params.SessionID != sessionHeader {
+		http.Error(w, "mismatched "+HeaderSessionID, http.StatusBadRequest)
+		return
+	}
+
+	// Validate responses to session-scoped server → client requests
+	// (request_permission, fs/read, ...). Per the RFD these response POSTs
+	// are session-scoped and must echo the Acp-Session-Id of the stream
+	// the request was delivered on; a contradicting header is rejected. A
+	// *missing* header is tolerated — the Rust reference client never sends
+	// one on responses, and the header is not needed for routing here — so
+	// we stay interoperable where the TypeScript reference server would 400.
+	var respondedIDKey string
+	if envelope.Method == "" {
+		if idKey := acphttp.CanonicalIDFromRaw(envelope.ID); idKey != "" {
+			if sid, ok := conn.peekClientResponseSession(idKey); ok {
+				if sessionHeader != "" && sessionHeader != sid {
+					http.Error(w, "mismatched "+HeaderSessionID, http.StatusBadRequest)
+					return
+				}
+				respondedIDKey = idKey
+			}
+		}
 	}
 
 	// Record where this request's response (if any) should be routed.
@@ -111,6 +170,9 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 	if err := conn.writeToAgent(body); err != nil {
 		http.Error(w, fmt.Sprintf("failed to forward %s to agent %s: %v", envelope.Method, connID, err), http.StatusInternalServerError)
 		return
+	}
+	if respondedIDKey != "" {
+		conn.dropClientResponseSession(respondedIDKey)
 	}
 	w.WriteHeader(http.StatusAccepted)
 }
@@ -160,6 +222,20 @@ func (s *Server) handleInitialize(w http.ResponseWriter, r *http.Request, body [
 	}
 
 	w.Header().Set("Content-Type", mimeJSON)
+
+	// A JSON-RPC error response to initialize means the agent rejected the
+	// connection. Match the Rust reference server: tear the connection down
+	// and return the error body WITHOUT an Acp-Connection-Id header, so the
+	// client does not hold a handle to a connection that no longer exists.
+	if acphttp.IsErrorResponse([]byte(initResponse)) {
+		s.removeConn(conn.id)
+		conn.shutdown()
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(initResponse))
+		conn.logger.Info("initialize rejected")
+		return
+	}
+
 	w.Header().Set(HeaderConnectionID, conn.id)
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(initResponse))
@@ -223,6 +299,12 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Emit an SSE comment on idle streams so proxies and load balancers do
+	// not reap the connection, and so a dead client is detected by the
+	// failed write. Both reference servers do this at the same interval.
+	keepAlive := time.NewTicker(sseKeepAliveInterval)
+	defer keepAlive.Stop()
+
 	for {
 		select {
 		case <-r.Context().Done():
@@ -231,6 +313,10 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 			return
 		case <-sub.done:
 			return
+		case <-keepAlive.C:
+			if !writeSSEKeepAlive(w, rc) {
+				return
+			}
 		case msg, ok := <-sub.ch:
 			if !ok {
 				return
@@ -264,6 +350,15 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 // error).
 func writeSSEEvent(w http.ResponseWriter, rc *http.ResponseController, msg string) bool {
 	if _, err := fmt.Fprintf(w, "data: %s\n\n", msg); err != nil {
+		return false
+	}
+	return rc.Flush() == nil
+}
+
+// writeSSEKeepAlive writes an SSE comment line (which clients must ignore
+// per the SSE spec) and flushes. Returns false if the client is gone.
+func writeSSEKeepAlive(w http.ResponseWriter, rc *http.ResponseController) bool {
+	if _, err := io.WriteString(w, ":\n\n"); err != nil {
 		return false
 	}
 	return rc.Flush() == nil

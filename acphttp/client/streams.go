@@ -199,7 +199,8 @@ func (t *Transport) runSingleStream(ctx context.Context, connID, sessionID, labe
 				onConnected()
 			}
 		}
-		t.logger.Debug("SSE event",
+		t.logger.Debug(
+			"SSE event",
 			"stream", label,
 			"session_id", sessionID,
 			"bytes", len(payload),
@@ -214,6 +215,12 @@ func (t *Transport) runSingleStream(ctx context.Context, connID, sessionID, labe
 			if sid := acphttp.PeekResultSessionID([]byte(payload)); sid != "" {
 				t.ensureSessionStream(sid)
 			}
+		}
+		// A server → client *request* arriving on a session-scoped stream
+		// obliges us to echo Acp-Session-Id when the SDK POSTs the
+		// response; remember the session for dispatch() to look up.
+		if sessionID != "" && acphttp.HasMethod([]byte(payload)) {
+			t.recordServerRequestSession(acphttp.CanonicalID([]byte(payload)), sessionID)
 		}
 		t.pushInbound([]byte(payload))
 	})

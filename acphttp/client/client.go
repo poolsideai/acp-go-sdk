@@ -114,6 +114,17 @@ type Transport struct {
 	connGetOpen bool
 	streams     sync.WaitGroup
 
+	// respSessions maps the canonical JSON-RPC id of each inbound server →
+	// client request to the session-scoped stream it arrived on. When the
+	// SDK sends the response back, the POST must echo that session in
+	// Acp-Session-Id: the RFD makes responses to session-scoped server
+	// requests (request_permission, fs/read, ...) session-scoped POSTs, and
+	// the TypeScript reference server rejects them without the header. A
+	// response carries no params.sessionId, so this table is the only
+	// source for it.
+	respSessionsMu sync.Mutex
+	respSessions   map[string]string
+
 	// inbound carries demultiplexed JSON messages (without trailing newlines)
 	// from all server-to-client streams plus the initialize response body.
 	inbound chan []byte
@@ -208,6 +219,7 @@ func Dial(ctx context.Context, cfg Config) (*Transport, error) {
 		ctx:             tctx,
 		cancel:          cancel,
 		sessionGets:     make(map[string]context.CancelFunc),
+		respSessions:    make(map[string]string),
 		inbound:         make(chan []byte, inboundChanCapacity),
 		closedCh:        make(chan struct{}),
 	}
@@ -313,6 +325,32 @@ func (t *Transport) pushInbound(raw []byte) {
 	case <-t.closedCh:
 	case <-t.ctx.Done():
 	}
+}
+
+// recordServerRequestSession remembers which session-scoped stream the
+// server request identified by idKey arrived on, so the response POST can
+// echo the matching Acp-Session-Id header.
+func (t *Transport) recordServerRequestSession(idKey, sessionID string) {
+	if idKey == "" {
+		return
+	}
+	t.respSessionsMu.Lock()
+	t.respSessions[idKey] = sessionID
+	t.respSessionsMu.Unlock()
+}
+
+// takeServerRequestSession returns and removes the session recorded for
+// idKey, or "" if none was recorded (the request arrived on the
+// connection-scoped stream, or idKey is empty).
+func (t *Transport) takeServerRequestSession(idKey string) string {
+	if idKey == "" {
+		return ""
+	}
+	t.respSessionsMu.Lock()
+	defer t.respSessionsMu.Unlock()
+	sid := t.respSessions[idKey]
+	delete(t.respSessions, idKey)
+	return sid
 }
 
 // peekID returns the JSON-RPC id of raw as a string, suitable for log

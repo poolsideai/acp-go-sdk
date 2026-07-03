@@ -352,6 +352,81 @@ func TestSessionPromptSendsRequiredHeaders(t *testing.T) {
 	assert.Equal(t, "sess-abc", promptHdrs.Get(headerSessionID))
 }
 
+// TestResponseToServerRequestEchoesSessionHeader verifies the RFD rule that
+// responses to server-initiated requests delivered on a session-scoped
+// stream are themselves session-scoped POSTs: the transport must remember
+// which session stream the request arrived on and echo Acp-Session-Id on
+// the response. The TypeScript reference server rejects such responses with
+// 400 when the header is missing.
+func TestResponseToServerRequestEchoesSessionHeader(t *testing.T) {
+	fs := newFakeServer(t)
+	base, stop := startH2CServer(t, fs)
+	defer stop()
+
+	tr, err := Dial(context.Background(), Config{BaseURL: base})
+	require.NoError(t, err)
+	defer tr.Close()
+
+	_, err = tr.Write([]byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}` + "\n"))
+	require.NoError(t, err)
+	_ = readOneLine(t, tr, 2*time.Second)
+
+	// A prompt opens the session-scoped stream for sess-abc.
+	_, err = tr.Write([]byte(`{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":"sess-abc","prompt":[]}}` + "\n"))
+	require.NoError(t, err)
+
+	// Server sends a request_permission request on the session stream.
+	fs.sendSessionEvent("sess-abc",
+		`{"jsonrpc":"2.0","id":77,"method":"session/request_permission","params":{"sessionId":"sess-abc","toolCall":{"toolCallId":"tc"},"options":[]}}`)
+	got := readOneLine(t, tr, 2*time.Second)
+	require.Contains(t, got, "session/request_permission")
+
+	// The SDK answers; the transport must attach Acp-Session-Id: sess-abc.
+	resp := `{"jsonrpc":"2.0","id":77,"result":{"outcome":{"outcome":"selected","optionId":"allow"}}}`
+	_, err = tr.Write([]byte(resp + "\n"))
+	require.NoError(t, err)
+
+	fs.mu.Lock()
+	var respHdrs http.Header
+	for i, raw := range fs.posts {
+		if bytes.Contains(raw, []byte(`"result"`)) && bytes.Contains(raw, []byte(`"id":77`)) {
+			respHdrs = fs.gotHeaders[i]
+			break
+		}
+	}
+	fs.mu.Unlock()
+
+	require.NotNil(t, respHdrs, "server should have received the response POST")
+	assert.Equal(t, "sess-abc", respHdrs.Get(headerSessionID),
+		"response to a session-scoped server request must echo Acp-Session-Id")
+}
+
+// TestInitializeRejectedDeliversAgentError covers the rejected-initialize
+// shape produced by the Rust reference server (and this SDK's server): 200
+// with a JSON-RPC error body and no Acp-Connection-Id header. The transport
+// must deliver the agent's error to the SDK rather than fail on the missing
+// header.
+func TestInitializeRejectedDeliversAgentError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", mimeJSON)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"initialize rejected"}}`))
+	}))
+	defer srv.Close()
+
+	tr, err := Dial(context.Background(), Config{BaseURL: srv.URL + "/acp"})
+	require.NoError(t, err)
+	defer tr.Close()
+
+	_, err = tr.Write([]byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}` + "\n"))
+	require.NoError(t, err, "a rejected initialize is not a transport error")
+
+	got := readOneLine(t, tr, 2*time.Second)
+	assert.Contains(t, got, `"error"`)
+	assert.Contains(t, got, "initialize rejected")
+	assert.Empty(t, tr.getConnID(), "no connection id must be retained after a rejected initialize")
+}
+
 func TestCloseSendsDelete(t *testing.T) {
 	fs := newFakeServer(t)
 	base, stop := startH2CServer(t, fs)
