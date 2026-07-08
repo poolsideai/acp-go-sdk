@@ -93,6 +93,10 @@ func (a *demoAgent) CloseSession(ctx context.Context, _ acp.CloseSessionRequest)
 	return acp.CloseSessionResponse{}, acp.NewMethodNotFound(acp.AgentMethodSessionClose)
 }
 
+func (a *demoAgent) DeleteSession(ctx context.Context, _ acp.DeleteSessionRequest) (acp.DeleteSessionResponse, error) {
+	return acp.DeleteSessionResponse{}, acp.NewMethodNotFound(acp.AgentMethodSessionDelete)
+}
+
 func (a *demoAgent) SetSessionMode(ctx context.Context, _ acp.SetSessionModeRequest) (acp.SetSessionModeResponse, error) {
 	return acp.SetSessionModeResponse{}, nil
 }

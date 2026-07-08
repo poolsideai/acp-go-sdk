@@ -121,6 +121,10 @@ func (a *stubAgent) CloseSession(ctx context.Context, params acp.CloseSessionReq
 	return acp.CloseSessionResponse{}, nil
 }
 
+func (a *stubAgent) DeleteSession(ctx context.Context, params acp.DeleteSessionRequest) (acp.DeleteSessionResponse, error) {
+	return acp.DeleteSessionResponse{}, nil
+}
+
 // startServer spins up a test HTTP server around a new server.Server with
 // the given factory, and returns the base URL and a cleanup.
 func startServer(t *testing.T, factory AgentFactory) (baseURL string, stop func()) {
