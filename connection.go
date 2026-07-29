@@ -22,14 +22,19 @@ const (
 	notificationQueueWarnDepth = 8192
 )
 
-// maxQueuedNotifications is a runaway guard, not a backpressure bound: an
-// agent's session/load replay legitimately bursts tens of thousands of
-// notifications faster than the sequential consumer decodes them, and each
-// buffered entry is only an envelope whose raw JSON is already in memory.
-// Severing the connection is reserved for a peer that outruns the consumer by
-// this much, which indicates a peer that will never drain. A variable so tests
-// can exercise the guard without a million-message fixture.
-var maxQueuedNotifications = 1 << 20
+// maxQueuedNotifications and maxQueuedNotificationBytes are runaway guards,
+// not backpressure bounds: an agent's session/load replay legitimately bursts
+// tens of thousands of notifications faster than the sequential consumer
+// decodes them, and severing the connection is reserved for a peer that
+// outruns the consumer so far it will plainly never drain. Buffered entries
+// own their decoded copies of the wire bytes (unmarshalling copies out of the
+// reused scanner buffer), so the byte guard is what actually bounds memory;
+// the entry guard is a companion bound for pathological tiny-message floods.
+// Variables so tests can exercise the guards without huge fixtures.
+var (
+	maxQueuedNotifications     = 1 << 20
+	maxQueuedNotificationBytes = 256 << 20
+)
 
 var errNotificationQueueOverflow = errors.New("notification queue overflow")
 
@@ -44,7 +49,10 @@ type anyMessage struct {
 
 type queuedNotification struct {
 	seq uint64
-	msg *anyMessage
+	// size is the wire length of the message, charged against
+	// maxQueuedNotificationBytes while the entry sits in the buffer.
+	size int
+	msg  *anyMessage
 }
 
 type responseEnvelope struct {
@@ -109,6 +117,8 @@ type Connection struct {
 	// notificationClosed tells processNotifications to exit once the buffer is
 	// drained; set by shutdownReceive in place of closing a channel.
 	notificationClosed bool
+	// notificationBufBytes is the wire bytes currently held in notificationBuf.
+	notificationBufBytes int
 	// notificationWarnAt is the next buffer depth that logs a warning.
 	notificationWarnAt int
 }
@@ -447,17 +457,22 @@ func (c *Connection) receive() {
 			// Queue the notification for sequential processing. The sequence number marks
 			// the response-scoped barrier boundary for requests that observe later responses.
 			m := msg
+			size := len(line)
 			c.notifyMu.Lock()
 			depth := len(c.notificationBuf) - c.notificationHead
-			if depth >= maxQueuedNotifications {
+			if depth >= maxQueuedNotifications || c.notificationBufBytes+size > maxQueuedNotificationBytes {
+				bufferedBytes := c.notificationBufBytes
 				c.notifyMu.Unlock()
-				c.loggerOrDefault().Error("failed to queue notification; closing connection", "err", errNotificationQueueOverflow, "capacity", maxQueuedNotifications, "queued", depth)
+				c.loggerOrDefault().Error("failed to queue notification; closing connection",
+					"err", errNotificationQueueOverflow, "capacity", maxQueuedNotifications, "queued", depth,
+					"byte_capacity", maxQueuedNotificationBytes, "buffered_bytes", bufferedBytes)
 				c.shutdownReceive(errNotificationQueueOverflow)
 				return
 			}
 			c.lastEnqueuedNotificationSeq++
 			seq := c.lastEnqueuedNotificationSeq
-			c.notificationBuf = append(c.notificationBuf, queuedNotification{seq: seq, msg: &m})
+			c.notificationBuf = append(c.notificationBuf, queuedNotification{seq: seq, size: size, msg: &m})
+			c.notificationBufBytes += size
 			var warnDepth int
 			if depth+1 >= c.notificationWarnAt {
 				warnDepth = depth + 1
@@ -521,6 +536,10 @@ func (c *Connection) processNotifications() {
 		for c.notificationHead >= len(c.notificationBuf) && !c.notificationClosed {
 			c.notificationBuf = nil
 			c.notificationHead = 0
+			c.notificationBufBytes = 0
+			// The consumer caught up, so the next burst warns from the base
+			// threshold again instead of inheriting this one's doubling.
+			c.notificationWarnAt = notificationQueueWarnDepth
 			c.notifyCond.Wait()
 		}
 		if c.notificationHead >= len(c.notificationBuf) {
@@ -530,6 +549,7 @@ func (c *Connection) processNotifications() {
 		queued := c.notificationBuf[c.notificationHead]
 		c.notificationBuf[c.notificationHead] = queuedNotification{}
 		c.notificationHead++
+		c.notificationBufBytes -= queued.size
 		// Compact once the consumed prefix dominates, so a long-lived
 		// connection does not pin every burst it ever buffered.
 		if c.notificationHead > 1024 && c.notificationHead*2 >= len(c.notificationBuf) {

@@ -888,6 +888,83 @@ func TestConnectionBuffersNotificationBurstsWithoutDisconnecting(t *testing.T) {
 		t.Fatalf("connection closed after draining burst: %v", context.Cause(c.ctx))
 	default:
 	}
+
+	// Once the consumer catches up it releases the buffer's byte accounting
+	// and re-arms the depth warning at the base threshold.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		c.notifyMu.Lock()
+		bufBytes, warnAt := c.notificationBufBytes, c.notificationWarnAt
+		c.notifyMu.Unlock()
+		if bufBytes == 0 && warnAt == notificationQueueWarnDepth {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("buffer accounting not reset after drain: bytes=%d warnAt=%d", bufBytes, warnAt)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestConnectionClosesOnNotificationByteRunaway(t *testing.T) {
+	prevMax := maxQueuedNotificationBytes
+	maxQueuedNotificationBytes = 4096
+	defer func() { maxQueuedNotificationBytes = prevMax }()
+
+	incomingR, incomingW := io.Pipe()
+
+	// Block the first notification handler so the buffer fills deterministically.
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var handled atomic.Int64
+
+	c := NewConnection(func(context.Context, string, json.RawMessage) (any, *RequestError) {
+		if handled.Add(1) == 1 {
+			close(firstStarted)
+			<-releaseFirst
+		}
+		return nil, nil
+	}, io.Discard, incomingR)
+
+	if _, err := io.WriteString(incomingW, `{"jsonrpc":"2.0","method":"test/notify","params":{}}`+"\n"); err != nil {
+		t.Fatalf("write first notification: %v", err)
+	}
+	select {
+	case <-firstStarted:
+	case <-time.After(1 * time.Second):
+		t.Fatalf("timeout waiting for first notification handler to start")
+	}
+
+	// Far fewer messages than the entry guard allows, but enough wire bytes to
+	// trip the byte guard. Written from a goroutine: once the guard trips the
+	// receive loop stops reading, so later writes block until the pipe closes.
+	notification := `{"jsonrpc":"2.0","method":"test/notify","params":{"filler":"` +
+		strings.Repeat("x", 512) + `"}}` + "\n"
+	writesDone := make(chan struct{})
+	go func() {
+		defer close(writesDone)
+		for i := 0; i < 10; i++ {
+			if _, err := io.WriteString(incomingW, notification); err != nil {
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-c.Done():
+	case <-time.After(1 * time.Second):
+		t.Fatalf("timeout waiting for connection cancellation on byte runaway")
+	}
+	_ = incomingW.Close()
+	<-writesDone
+
+	cause := context.Cause(c.ctx)
+	if !errors.Is(cause, errNotificationQueueOverflow) {
+		t.Fatalf("expected overflow cancellation cause, got %v", cause)
+	}
+
+	close(releaseFirst)
+	waitForNotificationBarrierDrain(t, c, 1*time.Second)
 }
 
 func TestConnectionClosesOnNotificationRunaway(t *testing.T) {
