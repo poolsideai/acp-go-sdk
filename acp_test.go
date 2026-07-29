@@ -837,10 +837,10 @@ func TestConnectionCancelsRequestHandlersOnDisconnectEvenWithNotificationBacklog
 	}
 }
 
-func TestConnectionFailsFastOnNotificationQueueOverflow(t *testing.T) {
+func TestConnectionBuffersNotificationBurstsWithoutDisconnecting(t *testing.T) {
 	incomingR, incomingW := io.Pipe()
 
-	// Block the first notification handler so the queue can fill deterministically.
+	// Block the first notification handler so the burst buffers deterministically.
 	firstStarted := make(chan struct{})
 	releaseFirst := make(chan struct{})
 	var handled atomic.Int64
@@ -862,17 +862,74 @@ func TestConnectionFailsFastOnNotificationQueueOverflow(t *testing.T) {
 		t.Fatalf("timeout waiting for first notification handler to start")
 	}
 
-	// Fill the buffered queue, then send one extra notification to force overflow.
-	for i := 0; i < defaultMaxQueuedNotifications+1; i++ {
+	// A session/load-sized replay burst, well past the old fixed 1024 cap. The
+	// connection must buffer it, not disconnect.
+	const burst = 5000
+	for i := 0; i < burst; i++ {
 		if _, err := io.WriteString(incomingW, `{"jsonrpc":"2.0","method":"test/notify","params":{}}`+"\n"); err != nil {
-			t.Fatalf("write overflow notification %d: %v", i, err)
+			t.Fatalf("write burst notification %d: %v", i, err)
+		}
+	}
+
+	select {
+	case <-c.Done():
+		t.Fatalf("connection closed during buffered burst: %v", context.Cause(c.ctx))
+	default:
+	}
+
+	close(releaseFirst)
+	waitForNotificationBarrierDrain(t, c, 5*time.Second)
+
+	if got := handled.Load(); got != burst+1 {
+		t.Fatalf("expected %d notifications handled, got %d", burst+1, got)
+	}
+	select {
+	case <-c.Done():
+		t.Fatalf("connection closed after draining burst: %v", context.Cause(c.ctx))
+	default:
+	}
+}
+
+func TestConnectionClosesOnNotificationRunaway(t *testing.T) {
+	prevMax := maxQueuedNotifications
+	maxQueuedNotifications = 64
+	defer func() { maxQueuedNotifications = prevMax }()
+
+	incomingR, incomingW := io.Pipe()
+
+	// Block the first notification handler so the buffer fills deterministically.
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var handled atomic.Int64
+
+	c := NewConnection(func(context.Context, string, json.RawMessage) (any, *RequestError) {
+		if handled.Add(1) == 1 {
+			close(firstStarted)
+			<-releaseFirst
+		}
+		return nil, nil
+	}, io.Discard, incomingR)
+
+	if _, err := io.WriteString(incomingW, `{"jsonrpc":"2.0","method":"test/notify","params":{}}`+"\n"); err != nil {
+		t.Fatalf("write first notification: %v", err)
+	}
+	select {
+	case <-firstStarted:
+	case <-time.After(1 * time.Second):
+		t.Fatalf("timeout waiting for first notification handler to start")
+	}
+
+	// Fill the buffer to the runaway guard, then one more to trip it.
+	for i := 0; i < maxQueuedNotifications+1; i++ {
+		if _, err := io.WriteString(incomingW, `{"jsonrpc":"2.0","method":"test/notify","params":{}}`+"\n"); err != nil {
+			t.Fatalf("write runaway notification %d: %v", i, err)
 		}
 	}
 
 	select {
 	case <-c.Done():
 	case <-time.After(1 * time.Second):
-		t.Fatalf("timeout waiting for connection cancellation on queue overflow")
+		t.Fatalf("timeout waiting for connection cancellation on notification runaway")
 	}
 
 	cause := context.Cause(c.ctx)

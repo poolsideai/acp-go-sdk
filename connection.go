@@ -16,8 +16,20 @@ import (
 
 const (
 	notificationQueueDrainTimeout = 5 * time.Second
-	defaultMaxQueuedNotifications = 1024
+	// notificationQueueWarnDepth is the buffered-notification depth at which the
+	// connection starts logging warnings; each crossing doubles the next
+	// threshold so a sustained burst logs a handful of lines, not thousands.
+	notificationQueueWarnDepth = 8192
 )
+
+// maxQueuedNotifications is a runaway guard, not a backpressure bound: an
+// agent's session/load replay legitimately bursts tens of thousands of
+// notifications faster than the sequential consumer decodes them, and each
+// buffered entry is only an envelope whose raw JSON is already in memory.
+// Severing the connection is reserved for a peer that outruns the consumer by
+// this much, which indicates a peer that will never drain. A variable so tests
+// can exercise the guard without a million-message fixture.
+var maxQueuedNotifications = 1 << 20
 
 var errNotificationQueueOverflow = errors.New("notification queue overflow")
 
@@ -86,9 +98,19 @@ type Connection struct {
 	lastEnqueuedNotificationSeq uint64
 	completedNotificationSeq    uint64
 
-	// notificationQueue serializes notification processing to maintain order.
-	// It is bounded to keep memory usage predictable.
-	notificationQueue chan queuedNotification
+	// notificationBuf buffers notifications for sequential processing (guarded
+	// by notifyMu, drained by processNotifications in enqueue order). It is
+	// elastic up to maxQueuedNotifications: replay bursts must cost memory the
+	// raw JSON already occupies, never the connection.
+	notificationBuf []queuedNotification
+	// notificationHead indexes the next unprocessed entry in notificationBuf;
+	// the prefix before it is consumed and periodically compacted away.
+	notificationHead int
+	// notificationClosed tells processNotifications to exit once the buffer is
+	// drained; set by shutdownReceive in place of closing a channel.
+	notificationClosed bool
+	// notificationWarnAt is the next buffer depth that logs a warning.
+	notificationWarnAt int
 }
 
 func NewConnection(handler MethodHandler, peerInput io.Writer, peerOutput io.Reader) *Connection {
@@ -105,7 +127,7 @@ func NewConnection(handler MethodHandler, peerInput io.Writer, peerOutput io.Rea
 		cancel:              cancel,
 		inboundCtx:          inboundCtx,
 		inboundCancel:       inboundCancel,
-		notificationQueue:   make(chan queuedNotification, defaultMaxQueuedNotifications),
+		notificationWarnAt:  notificationQueueWarnDepth,
 	}
 	c.notifyCond = sync.NewCond(&c.notifyMu)
 	go func() {
@@ -426,26 +448,25 @@ func (c *Connection) receive() {
 			// the response-scoped barrier boundary for requests that observe later responses.
 			m := msg
 			c.notifyMu.Lock()
-			c.lastEnqueuedNotificationSeq++
-			seq := c.lastEnqueuedNotificationSeq
-			select {
-			case c.notificationQueue <- queuedNotification{seq: seq, msg: &m}:
+			depth := len(c.notificationBuf) - c.notificationHead
+			if depth >= maxQueuedNotifications {
 				c.notifyMu.Unlock()
-			default:
-				if c.lastEnqueuedNotificationSeq != seq {
-					c.notifyMu.Unlock()
-					panic("notification sequence advanced while receive goroutine was queueing")
-				}
-				c.lastEnqueuedNotificationSeq--
-				// invariant: completedNotificationSeq never exceeds the highest accepted enqueue.
-				if c.completedNotificationSeq > c.lastEnqueuedNotificationSeq {
-					c.notifyMu.Unlock()
-					panic("completed notification sequence exceeded enqueued notification sequence")
-				}
-				c.notifyMu.Unlock()
-				c.loggerOrDefault().Error("failed to queue notification; closing connection", "err", errNotificationQueueOverflow, "capacity", cap(c.notificationQueue), "queued", len(c.notificationQueue))
+				c.loggerOrDefault().Error("failed to queue notification; closing connection", "err", errNotificationQueueOverflow, "capacity", maxQueuedNotifications, "queued", depth)
 				c.shutdownReceive(errNotificationQueueOverflow)
 				return
+			}
+			c.lastEnqueuedNotificationSeq++
+			seq := c.lastEnqueuedNotificationSeq
+			c.notificationBuf = append(c.notificationBuf, queuedNotification{seq: seq, msg: &m})
+			var warnDepth int
+			if depth+1 >= c.notificationWarnAt {
+				warnDepth = depth + 1
+				c.notificationWarnAt *= 2
+			}
+			c.notifyCond.Broadcast()
+			c.notifyMu.Unlock()
+			if warnDepth > 0 {
+				c.loggerOrDefault().Warn("notification queue depth high", "queued", warnDepth, "limit", maxQueuedNotifications)
 			}
 		default:
 			c.loggerOrDefault().Error("received message with neither id nor method", "raw", string(line))
@@ -467,17 +488,18 @@ func (c *Connection) shutdownReceive(cause error) {
 	// First, signal disconnect to callers waiting on responses.
 	c.cancel(cause)
 
-	// Then close the notification queue so already-received messages can drain.
+	// Then mark the notification buffer closed so already-received messages can
+	// drain and processNotifications exits once they have.
 	// IMPORTANT: Do not block this receive goroutine waiting for the drain to complete;
 	// notification handlers may legitimately block until their context is canceled.
-	close(c.notificationQueue)
-
 	c.notifyMu.Lock()
+	c.notificationClosed = true
 	finalEnqueuedSeq := c.lastEnqueuedNotificationSeq
 	if c.completedNotificationSeq > finalEnqueuedSeq {
 		c.notifyMu.Unlock()
 		panic("completed notification sequence exceeded final enqueued sequence during shutdown")
 	}
+	c.notifyCond.Broadcast()
 	c.notifyMu.Unlock()
 
 	// Cancel inboundCtx after notifications finish, but ensure we don't leak forever if a
@@ -491,9 +513,31 @@ func (c *Connection) shutdownReceive(cause error) {
 }
 
 // processNotifications processes notifications sequentially to maintain order.
-// It terminates when notificationQueue is closed (e.g. on disconnect in receive()).
+// It terminates once the buffer is marked closed (on disconnect in receive())
+// and every already-received notification has drained.
 func (c *Connection) processNotifications() {
-	for queued := range c.notificationQueue {
+	for {
+		c.notifyMu.Lock()
+		for c.notificationHead >= len(c.notificationBuf) && !c.notificationClosed {
+			c.notificationBuf = nil
+			c.notificationHead = 0
+			c.notifyCond.Wait()
+		}
+		if c.notificationHead >= len(c.notificationBuf) {
+			c.notifyMu.Unlock()
+			return
+		}
+		queued := c.notificationBuf[c.notificationHead]
+		c.notificationBuf[c.notificationHead] = queuedNotification{}
+		c.notificationHead++
+		// Compact once the consumed prefix dominates, so a long-lived
+		// connection does not pin every burst it ever buffered.
+		if c.notificationHead > 1024 && c.notificationHead*2 >= len(c.notificationBuf) {
+			c.notificationBuf = append([]queuedNotification(nil), c.notificationBuf[c.notificationHead:]...)
+			c.notificationHead = 0
+		}
+		c.notifyMu.Unlock()
+
 		c.handleInbound(c.inboundCtx, queued.msg)
 
 		c.notifyMu.Lock()
