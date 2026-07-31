@@ -115,3 +115,51 @@ func TestSessionConfigOptionSelect_MetadataUnmarshalAndMarshal(t *testing.T) {
 		t.Fatalf("identity metadata not emitted in json: %s", string(b))
 	}
 }
+
+func TestUnstableCreateElicitationRequest_ScopeRoundTrip(t *testing.T) {
+	t.Run("form session scope", func(t *testing.T) {
+		payload := []byte(`{"mode":"form","message":"Pick one","sessionId":"sess-1","toolCallId":"call-7","requestedSchema":{"type":"object","properties":{}}}`)
+		var got UnstableCreateElicitationRequest
+		if err := json.Unmarshal(payload, &got); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if got.Form == nil {
+			t.Fatal("expected form variant to be set")
+		}
+		if got.Form.SessionId != SessionId("sess-1") {
+			t.Fatalf("sessionId not preserved: %q", got.Form.SessionId)
+		}
+		if got.Form.ToolCallId == nil || *got.Form.ToolCallId != ToolCallId("call-7") {
+			t.Fatalf("toolCallId not preserved: %v", got.Form.ToolCallId)
+		}
+
+		b, err := json.Marshal(got)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var raw map[string]any
+		if err := json.Unmarshal(b, &raw); err != nil {
+			t.Fatalf("unmarshal raw: %v", err)
+		}
+		if raw["sessionId"] != "sess-1" || raw["toolCallId"] != "call-7" {
+			t.Fatalf("scope not emitted in json: %s", string(b))
+		}
+	})
+
+	t.Run("url request scope", func(t *testing.T) {
+		payload := []byte(`{"mode":"url","message":"Sign in","elicitationId":"el-1","url":"https://example.com","requestId":42}`)
+		var got UnstableCreateElicitationRequest
+		if err := json.Unmarshal(payload, &got); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if got.Url == nil {
+			t.Fatal("expected url variant to be set")
+		}
+		if got.Url.SessionId != SessionId("") {
+			t.Fatalf("expected empty sessionId, got %q", got.Url.SessionId)
+		}
+		if got.Url.RequestId == nil || got.Url.RequestId.Number == nil || *got.Url.RequestId.Number != RequestIdNumber(42) {
+			t.Fatalf("requestId not preserved: %+v", got.Url.RequestId)
+		}
+	})
+}

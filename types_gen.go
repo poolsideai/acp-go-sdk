@@ -6757,6 +6757,14 @@ type UnstableCreateElicitationForm struct {
 	Mode    string `json:"mode"`
 	// A JSON Schema describing the form fields to present to the user.
 	RequestedSchema UnstableElicitationSchema `json:"requestedSchema"`
+	// The session this elicitation is tied to, when session-scoped.
+	// Poolside patch: the schema flattens ElicitationFormMode's scope
+	// (session or request) into the request; the generator drops it.
+	SessionId SessionId `json:"sessionId,omitempty"`
+	// Optional tool call within the session.
+	ToolCallId *ToolCallId `json:"toolCallId,omitempty"`
+	// The request this elicitation is tied to, when request-scoped.
+	RequestId *RequestId `json:"requestId,omitempty"`
 }
 
 // URL-based elicitation where the client directs the user to a URL.
@@ -6774,6 +6782,14 @@ type UnstableCreateElicitationUrl struct {
 	Mode    string `json:"mode"`
 	// The URL to direct the user to.
 	Url string `json:"url"`
+	// The session this elicitation is tied to, when session-scoped.
+	// Poolside patch: the schema flattens ElicitationUrlMode's scope
+	// (session or request) into the request; the generator drops it.
+	SessionId SessionId `json:"sessionId,omitempty"`
+	// Optional tool call within the session.
+	ToolCallId *ToolCallId `json:"toolCallId,omitempty"`
+	// The request this elicitation is tied to, when request-scoped.
+	RequestId *RequestId `json:"requestId,omitempty"`
 }
 
 type UnstableCreateElicitationRequest struct {
