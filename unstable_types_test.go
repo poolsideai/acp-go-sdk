@@ -163,3 +163,23 @@ func TestUnstableCreateElicitationRequest_ScopeRoundTrip(t *testing.T) {
 		}
 	})
 }
+
+func TestUnstableCreateElicitationForm_PreservesRawSchemaOrder(t *testing.T) {
+	// Property order is meaningful to clients (form field order); the typed
+	// Properties map cannot carry it, so the raw bytes must survive.
+	payload := []byte(`{"mode":"form","message":"Q","sessionId":"s","requestedSchema":{"type":"object","properties":{"zebra":{"type":"string"},"apple":{"type":"string"}},"required":["zebra"]}}`)
+	var got UnstableCreateElicitationRequest
+	if err := json.Unmarshal(payload, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.Form == nil {
+		t.Fatal("expected form variant to be set")
+	}
+	want := `{"type":"object","properties":{"zebra":{"type":"string"},"apple":{"type":"string"}},"required":["zebra"]}`
+	if string(got.Form.RequestedSchemaRaw) != want {
+		t.Fatalf("raw schema not preserved: %s", string(got.Form.RequestedSchemaRaw))
+	}
+	if len(got.Form.RequestedSchema.Properties) != 2 {
+		t.Fatalf("typed schema not decoded: %+v", got.Form.RequestedSchema)
+	}
+}

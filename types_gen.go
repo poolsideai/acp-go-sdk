@@ -6765,6 +6765,28 @@ type UnstableCreateElicitationForm struct {
 	ToolCallId *ToolCallId `json:"toolCallId,omitempty"`
 	// The request this elicitation is tied to, when request-scoped.
 	RequestId *RequestId `json:"requestId,omitempty"`
+	// RequestedSchemaRaw preserves the request's original requestedSchema
+	// bytes. Poolside patch: RequestedSchema's Properties map loses the JSON
+	// object's property order, which clients use as the form's field order.
+	RequestedSchemaRaw json.RawMessage `json:"-"`
+}
+
+// UnmarshalJSON captures the raw requestedSchema alongside the typed decode.
+// Poolside patch: see RequestedSchemaRaw.
+func (v *UnstableCreateElicitationForm) UnmarshalJSON(b []byte) error {
+	type alias UnstableCreateElicitationForm
+	var a alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	*v = UnstableCreateElicitationForm(a)
+	var raw struct {
+		RequestedSchema json.RawMessage `json:"requestedSchema"`
+	}
+	if err := json.Unmarshal(b, &raw); err == nil {
+		v.RequestedSchemaRaw = raw.RequestedSchema
+	}
+	return nil
 }
 
 // URL-based elicitation where the client directs the user to a URL.
